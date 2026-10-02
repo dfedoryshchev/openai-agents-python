@@ -7,10 +7,13 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openai.types.chat.chat_completion import ChatCompletion, Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.responses.response_output_item import Program, ProgramOutput
 
 from agents import (
     Agent,
+    OpenAIChatCompletionsModel,
     ProgrammaticToolCallingTool,
     Runner,
     TResponseInputItem,
@@ -617,6 +620,71 @@ class TestOpenAIConversationsSessionRunnerIntegration:
                 # Check that previous conversation is included
                 input_contents = [str(item.get("content", "")) for item in last_input]
                 assert any("Golden Gate Bridge" in content for content in input_contents)
+
+    @pytest.mark.allow_call_model_methods
+    @pytest.mark.asyncio
+    async def test_runner_replays_history_through_chat_completions_model(self, mock_openai_client):
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+        conversation_history = [
+            {
+                "id": "msg_user",
+                "type": "message",
+                "role": "user",
+                "status": "completed",
+                "content": [
+                    {"type": "input_text", "text": "What city is the Golden Gate Bridge in?"}
+                ],
+            },
+            {
+                "id": "msg_assistant",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "San Francisco", "annotations": []}],
+            },
+        ]
+
+        class DummyCompletions:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, Any] = {}
+
+            async def create(self, **kwargs: Any) -> ChatCompletion:
+                self.kwargs = kwargs
+                return ChatCompletion(
+                    id="resp-id",
+                    created=0,
+                    model="fake",
+                    object="chat.completion",
+                    choices=[
+                        Choice(
+                            index=0,
+                            finish_reason="stop",
+                            message=ChatCompletionMessage(role="assistant", content="California"),
+                        )
+                    ],
+                )
+
+        completions = DummyCompletions()
+        client = MagicMock()
+        client.chat.completions = completions
+        agent = Agent(
+            name="test",
+            model=OpenAIChatCompletionsModel(model="gpt-4.1", openai_client=client),
+        )
+
+        with patch.object(session, "get_items", return_value=conversation_history):
+            with patch.object(session, "add_items"):
+                result = await Runner.run(agent, "What state is it in?", session=session)
+
+        assert result.final_output == "California"
+        assert completions.kwargs["messages"] == [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "What city is the Golden Gate Bridge in?"}],
+            },
+            {"role": "assistant", "content": "San Francisco"},
+            {"role": "user", "content": "What state is it in?"},
+        ]
 
     @pytest.mark.asyncio
     async def test_runner_persists_program_item_ids(self, mock_openai_client):
